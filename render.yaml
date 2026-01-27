@@ -1,0 +1,24 @@
+services:
+  - type: worker
+    name: deal-forwarder-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python deal_forwarder_bot_render.py
+    plan: free
+    envVars:
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SOURCE_CHANNELS
+        sync: false
+      - key: EXTRAPE_BOT
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
