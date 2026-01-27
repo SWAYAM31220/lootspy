@@ -8,11 +8,10 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from supabase import create_client, Client
 from dotenv import load_dotenv
-
 from flask import Flask
 
 # ==================================================
-# Load env
+# ENV LOAD
 # ==================================================
 load_dotenv()
 
@@ -23,25 +22,26 @@ SESSION_STRING = os.getenv("SESSION_STRING", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-EXTRAPE_BOT = os.getenv("EXTRAPE_BOT")
 SOURCE_CHANNELS_RAW = os.getenv("SOURCE_CHANNELS", "")
+EXTRAPE_BOT = os.getenv("EXTRAPE_BOT")           # @botusername or ID
+LOG_CHANNEL_ID = -1003060200056 # -100xxxxxx
 
 PORT = int(os.getenv("PORT", 10000))
 
 # ==================================================
-# Minimal HTTP server (for Render Web Service)
+# WEB SERVICE (Render requirement)
 # ==================================================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Userbot is running", 200
+    return "Userbot running", 200
 
 def run_web():
     app.run(host="0.0.0.0", port=PORT)
 
 # ==================================================
-# Parse source channels (IDs + usernames)
+# PARSE SOURCE CHANNELS (IDs + usernames)
 # ==================================================
 def parse_source_channels(raw: str):
     result = []
@@ -58,7 +58,7 @@ def parse_source_channels(raw: str):
 RAW_SOURCE_CHANNELS = parse_source_channels(SOURCE_CHANNELS_RAW)
 
 # ==================================================
-# Telegram client
+# TELEGRAM CLIENT
 # ==================================================
 client = TelegramClient(
     StringSession(SESSION_STRING) if SESSION_STRING else StringSession(),
@@ -67,12 +67,12 @@ client = TelegramClient(
 )
 
 # ==================================================
-# Supabase
+# SUPABASE
 # ==================================================
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==================================================
-# Helpers
+# UTIL FUNCTIONS
 # ==================================================
 def normalize_product_name(text: str) -> str:
     text = text.lower()
@@ -89,6 +89,12 @@ def extract_product_name(text: str) -> str:
             return normalize_product_name(line[:200])
     return normalize_product_name(text[:200])
 
+async def log(msg: str):
+    try:
+        await client.send_message(LOG_CHANNEL_ID, msg)
+    except Exception as e:
+        print("[LOG ERROR]", e)
+
 async def is_duplicate(product_name: str) -> bool:
     try:
         cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
@@ -101,7 +107,7 @@ async def is_duplicate(product_name: str) -> bool:
         )
         return bool(res.data)
     except Exception as e:
-        print("[Supabase] duplicate check error:", e)
+        await log(f"❌ Duplicate check error\n{repr(e)}")
         return False
 
 async def save_deal(product_name: str, source: str):
@@ -112,7 +118,7 @@ async def save_deal(product_name: str, source: str):
             "created_at": datetime.utcnow().isoformat()
         }).execute()
     except Exception as e:
-        print("[Supabase] insert error:", e)
+        await log(f"❌ Save deal error\n{repr(e)}")
 
 async def cleanup_old():
     try:
@@ -120,58 +126,74 @@ async def cleanup_old():
         supabase.table("forwarded_deals").delete().lt(
             "created_at", cutoff
         ).execute()
-        print("[Cleanup] old records removed")
+        await log("🧹 Old records cleaned")
     except Exception as e:
-        print("[Cleanup] error:", e)
+        await log(f"❌ Cleanup error\n{repr(e)}")
 
 # ==================================================
-# Telegram logic
+# TELEGRAM MAIN LOGIC
 # ==================================================
 async def telegram_main():
     await client.start()
 
     if not SESSION_STRING:
-        print("\nSAVE THIS SESSION STRING:\n")
-        print(client.session.save())
-        print("\nAdd it to Render env as SESSION_STRING\n")
+        sess = client.session.save()
+        print("\nSAVE THIS SESSION STRING:\n", sess)
+        await log("⚠️ SESSION_STRING missing, check logs")
 
     SOURCE_ENTITIES = []
     for ch in RAW_SOURCE_CHANNELS:
         try:
             ent = await client.get_entity(ch)
             SOURCE_ENTITIES.append(ent)
-            print(f"[OK] Resolved source: {ch}")
+            await log(f"✅ Source resolved: {ch}")
         except Exception as e:
-            print(f"[ERROR] Cannot access {ch}: {e}")
+            await log(f"❌ Cannot access source {ch}\n{repr(e)}")
 
     if not SOURCE_ENTITIES:
-        raise RuntimeError("No valid source channels resolved")
+        await log("❌ No valid source channels. Exiting.")
+        return
+
+    await log("🚀 Userbot started")
+    await log(f"👀 Watching: {RAW_SOURCE_CHANNELS}")
+    await log(f"➡️ Forwarding to: {EXTRAPE_BOT}")
 
     @client.on(events.NewMessage(chats=SOURCE_ENTITIES))
     async def handler(event):
         try:
-            text = event.message.text
+            msg = event.message
+
+            # text OR caption
+            text = msg.message
             if not text:
+                await log(f"⚠️ No text/caption | Chat {event.chat_id} | Msg {msg.id}")
                 return
 
             product_name = extract_product_name(text)
             if len(product_name) < 5:
+                await log(f"⚠️ Short product name | {text[:60]}")
                 return
 
             if await is_duplicate(product_name):
-                print("[SKIP] duplicate:", product_name[:40])
+                await log(f"🔁 Duplicate skipped\n{product_name}")
                 return
 
-            await client.forward_messages(EXTRAPE_BOT, event.message)
+            await client.forward_messages(EXTRAPE_BOT, msg)
+
             await save_deal(
                 product_name,
                 event.chat.username or str(event.chat_id)
             )
 
-            print("[FORWARDED]", product_name[:40])
+            await log(
+                f"✅ FORWARDED\n"
+                f"📦 {product_name}\n"
+                f"📍 From: {event.chat.username or event.chat_id}\n"
+                f"🆔 Msg ID: {msg.id}"
+            )
 
         except Exception as e:
-            print("[Handler error]", e)
+            await log(f"❌ Handler error\n{repr(e)}")
 
     async def periodic_cleanup():
         while True:
@@ -179,15 +201,11 @@ async def telegram_main():
             await cleanup_old()
 
     asyncio.create_task(periodic_cleanup())
-    print("Userbot running...")
     await client.run_until_disconnected()
 
 # ==================================================
-# Entrypoint
+# ENTRYPOINT
 # ==================================================
 if __name__ == "__main__":
-    # Start web server in separate thread
     threading.Thread(target=run_web, daemon=True).start()
-
-    # Start telegram bot
     asyncio.run(telegram_main())
