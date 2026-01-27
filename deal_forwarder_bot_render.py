@@ -15,7 +15,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 SOURCE_CHANNELS_RAW = os.getenv("SOURCE_CHANNELS")   # usernames + IDs
 DEST_BOT = os.getenv("EXTRAPE_BOT")                  # @ExtraPeBot
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))    # -100xxxx
+LOG_CHANNEL_ID = -1003060200056    # -100xxxx
 PORT = int(os.getenv("PORT", 10000))
 
 # ================== WEB SERVER ==================
