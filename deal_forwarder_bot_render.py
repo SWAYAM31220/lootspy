@@ -9,121 +9,138 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_ID = int(os.getenv('TG_API_ID'))
-API_HASH = os.getenv('TG_API_HASH')
-SESSION_STRING = os.getenv('SESSION_STRING', '')
-SUPABASE_URL = os.getenv('SUPABASE_URL')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY')
-SOURCE_CHANNELS = [ch.strip() for ch in os.getenv('SOURCE_CHANNELS').split(',')]
-EXTRAPE_BOT = os.getenv('EXTRAPE_BOT')
+API_ID = int(os.getenv("TG_API_ID"))
+API_HASH = os.getenv("TG_API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+EXTRAPE_BOT = os.getenv("EXTRAPE_BOT")
 
-if SESSION_STRING:
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-else:
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+RAW_SOURCE_CHANNELS = [
+    int(ch.strip()) for ch in os.getenv("SOURCE_CHANNELS").split(",")
+]
 
+# Telegram client
+client = TelegramClient(
+    StringSession(SESSION_STRING) if SESSION_STRING else StringSession(),
+    API_ID,
+    API_HASH
+)
+
+# Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def normalize_product_name(text):
-    if not text:
-        return ""
+# ---------- Helpers ----------
+
+def normalize_product_name(text: str) -> str:
     text = text.lower()
-    text = re.sub(r'[^\w\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    text = text.strip()
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def extract_product_name(message_text):
+def extract_product_name(message_text: str) -> str:
     if not message_text:
         return ""
-    lines = message_text.split('\n')
-    
+
+    lines = message_text.split("\n")
     for line in lines[:3]:
         if len(line.strip()) > 10:
-            product_name = line.strip()[:200]
-            return normalize_product_name(product_name)
-    
+            return normalize_product_name(line[:200])
+
     return normalize_product_name(message_text[:200])
 
-async def is_duplicate(product_name):
+async def is_duplicate(product_name: str) -> bool:
     try:
         time_threshold = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-        
-        response = supabase.table('forwarded_deals').select('*').eq('product_name', product_name).gte('created_at', time_threshold).execute()
-        
-        return len(response.data) > 0
+        res = (
+            supabase.table("forwarded_deals")
+            .select("id")
+            .eq("product_name", product_name)
+            .gte("created_at", time_threshold)
+            .execute()
+        )
+        return bool(res.data)
     except Exception as e:
-        print(f"Error checking duplicate: {e}")
+        print(f"[Supabase] Duplicate check error: {e}")
         return False
 
-async def save_deal(product_name, source_channel):
+async def save_deal(product_name: str, source: str):
     try:
-        supabase.table('forwarded_deals').insert({
-            'product_name': product_name,
-            'source_channel': source_channel,
-            'created_at': datetime.utcnow().isoformat()
+        supabase.table("forwarded_deals").insert({
+            "product_name": product_name,
+            "source_channel": source,
+            "created_at": datetime.utcnow().isoformat()
         }).execute()
     except Exception as e:
-        print(f"Error saving deal: {e}")
+        print(f"[Supabase] Insert error: {e}")
 
 async def cleanup_old_records():
     try:
-        time_threshold = (datetime.utcnow() - timedelta(hours=48)).isoformat()
-        supabase.table('forwarded_deals').delete().lt('created_at', time_threshold).execute()
-        print(f"Cleaned up old records before {time_threshold}")
+        cutoff = (datetime.utcnow() - timedelta(hours=48)).isoformat()
+        supabase.table("forwarded_deals").delete().lt(
+            "created_at", cutoff
+        ).execute()
+        print("[Cleanup] Old records removed")
     except Exception as e:
-        print(f"Error cleaning up: {e}")
+        print(f"[Cleanup] Error: {e}")
 
-@client.on(events.NewMessage(chats=SOURCE_CHANNELS))
-async def handler(event):
-    try:
-        message_text = event.message.text
-        
-        if not message_text:
-            return
-        
-        product_name = extract_product_name(message_text)
-        
-        if not product_name or len(product_name) < 5:
-            return
-        
-        if await is_duplicate(product_name):
-            print(f"Duplicate detected: {product_name[:50]}... - Skipping")
-            return
-        
-        await client.forward_messages(EXTRAPE_BOT, event.message)
-        
-        await save_deal(product_name, event.chat.username or str(event.chat_id))
-        
-        print(f"Forwarded: {product_name[:50]}... from {event.chat.username or event.chat_id}")
-        
-    except Exception as e:
-        print(f"Error in handler: {e}")
+# ---------- Main ----------
+
+async def main():
+    await client.start()
+
+    if not SESSION_STRING:
+        print("\nSAVE THIS SESSION STRING:\n")
+        print(client.session.save())
+        print("\nAdd it to Render env as SESSION_STRING\n")
+
+    # 🔥 CRITICAL FIX: resolve entities ONCE
+    SOURCE_ENTITIES = []
+    for ch_id in RAW_SOURCE_CHANNELS:
+        try:
+            entity = await client.get_entity(ch_id)
+            SOURCE_ENTITIES.append(entity)
+            print(f"[OK] Resolved source: {ch_id}")
+        except Exception as e:
+            print(f"[ERROR] Cannot access {ch_id}: {e}")
+
+    if not SOURCE_ENTITIES:
+        raise RuntimeError("No valid source channels resolved. Bot exiting.")
+
+    @client.on(events.NewMessage(chats=SOURCE_ENTITIES))
+    async def handler(event):
+        try:
+            text = event.message.text
+            if not text:
+                return
+
+            product_name = extract_product_name(text)
+            if len(product_name) < 5:
+                return
+
+            if await is_duplicate(product_name):
+                print(f"[SKIP] Duplicate: {product_name[:40]}")
+                return
+
+            await client.forward_messages(EXTRAPE_BOT, event.message)
+            await save_deal(
+                product_name,
+                event.chat.username or str(event.chat_id)
+            )
+
+            print(f"[FORWARDED] {product_name[:40]}")
+
+        except Exception as e:
+            print(f"[Handler Error] {e}")
+
+    asyncio.create_task(periodic_cleanup())
+    print("Bot running and monitoring channels...")
+    await client.run_until_disconnected()
 
 async def periodic_cleanup():
     while True:
         await asyncio.sleep(3600)
         await cleanup_old_records()
 
-async def main():
-    await client.start()
-    
-    if not SESSION_STRING:
-        print("\n" + "="*50)
-        print("IMPORTANT: Save this session string!")
-        print("="*50)
-        print(client.session.save())
-        print("="*50)
-        print("\nAdd this as SESSION_STRING in Render environment variables")
-        print("\n")
-    
-    print("Bot started successfully!")
-    print(f"Monitoring channels: {SOURCE_CHANNELS}")
-    print(f"Forwarding to: {EXTRAPE_BOT}")
-    
-    asyncio.create_task(periodic_cleanup())
-    
-    await client.run_until_disconnected()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
