@@ -2,37 +2,66 @@ import os
 import re
 import asyncio
 from datetime import datetime, timedelta
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+# --------------------------------------------------
+# Load env
+# --------------------------------------------------
 load_dotenv()
 
 API_ID = int(os.getenv("TG_API_ID"))
 API_HASH = os.getenv("TG_API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-EXTRAPE_BOT = os.getenv("EXTRAPE_BOT")
 
-RAW_SOURCE_CHANNELS = [
-    int(ch.strip()) for ch in os.getenv("SOURCE_CHANNELS").split(",")
-]
+EXTRAPE_BOT = os.getenv("EXTRAPE_BOT")  # username or ID
+SOURCE_CHANNELS_RAW = os.getenv("SOURCE_CHANNELS", "")
 
+# --------------------------------------------------
+# Parse SOURCE_CHANNELS (supports IDs + usernames)
+# --------------------------------------------------
+def parse_source_channels(raw: str):
+    channels = []
+    for ch in raw.split(","):
+        ch = ch.strip()
+        if not ch:
+            continue
+
+        if ch.startswith("@"):
+            channels.append(ch)          # username
+        else:
+            channels.append(int(ch))     # numeric ID
+
+    return channels
+
+RAW_SOURCE_CHANNELS = parse_source_channels(SOURCE_CHANNELS_RAW)
+
+# --------------------------------------------------
 # Telegram client
+# --------------------------------------------------
 client = TelegramClient(
     StringSession(SESSION_STRING) if SESSION_STRING else StringSession(),
     API_ID,
     API_HASH
 )
 
-# Supabase
+# --------------------------------------------------
+# Supabase client
+# --------------------------------------------------
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- Helpers ----------
-
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
 def normalize_product_name(text: str) -> str:
+    if not text:
+        return ""
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -51,12 +80,12 @@ def extract_product_name(message_text: str) -> str:
 
 async def is_duplicate(product_name: str) -> bool:
     try:
-        time_threshold = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
         res = (
             supabase.table("forwarded_deals")
             .select("id")
             .eq("product_name", product_name)
-            .gte("created_at", time_threshold)
+            .gte("created_at", cutoff)
             .execute()
         )
         return bool(res.data)
@@ -84,8 +113,9 @@ async def cleanup_old_records():
     except Exception as e:
         print(f"[Cleanup] Error: {e}")
 
-# ---------- Main ----------
-
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
 async def main():
     await client.start()
 
@@ -94,19 +124,21 @@ async def main():
         print(client.session.save())
         print("\nAdd it to Render env as SESSION_STRING\n")
 
-    # 🔥 CRITICAL FIX: resolve entities ONCE
+    # -------- Resolve source entities ONCE --------
     SOURCE_ENTITIES = []
-    for ch_id in RAW_SOURCE_CHANNELS:
+
+    for ch in RAW_SOURCE_CHANNELS:
         try:
-            entity = await client.get_entity(ch_id)
+            entity = await client.get_entity(ch)
             SOURCE_ENTITIES.append(entity)
-            print(f"[OK] Resolved source: {ch_id}")
+            print(f"[OK] Resolved source: {ch}")
         except Exception as e:
-            print(f"[ERROR] Cannot access {ch_id}: {e}")
+            print(f"[ERROR] Cannot access {ch}: {e}")
 
     if not SOURCE_ENTITIES:
-        raise RuntimeError("No valid source channels resolved. Bot exiting.")
+        raise RuntimeError("No valid source channels resolved. Exiting.")
 
+    # -------- Message handler --------
     @client.on(events.NewMessage(chats=SOURCE_ENTITIES))
     async def handler(event):
         try:
@@ -123,6 +155,7 @@ async def main():
                 return
 
             await client.forward_messages(EXTRAPE_BOT, event.message)
+
             await save_deal(
                 product_name,
                 event.chat.username or str(event.chat_id)
@@ -133,14 +166,19 @@ async def main():
         except Exception as e:
             print(f"[Handler Error] {e}")
 
+    # -------- Background cleanup --------
+    async def periodic_cleanup():
+        while True:
+            await asyncio.sleep(3600)
+            await cleanup_old_records()
+
     asyncio.create_task(periodic_cleanup())
+
     print("Bot running and monitoring channels...")
     await client.run_until_disconnected()
 
-async def periodic_cleanup():
-    while True:
-        await asyncio.sleep(3600)
-        await cleanup_old_records()
-
+# --------------------------------------------------
+# Entrypoint
+# --------------------------------------------------
 if __name__ == "__main__":
     asyncio.run(main())
