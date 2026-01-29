@@ -1,10 +1,11 @@
 import os
 import re
+import uuid
 import hashlib
 import asyncio
 import threading
-from datetime import datetime, timedelta, timezone, date
-from typing import Optional, List, Dict, Tuple
+from datetime import datetime, timezone, date
+from typing import Optional, List, Tuple
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -37,9 +38,12 @@ PORT = int(os.getenv("PORT", "10000"))
 SUPABASE_URL = must_getenv("SUPABASE_URL")
 SUPABASE_KEY = must_getenv("SUPABASE_KEY")
 
-# Dedup policy: 1 forward per product_key per day (DB enforces via unique index)
-# Table must have: product_key (text not null), product_name, source_channel, day_bucket (date), created_at (timestamptz)
-# Unique index: (product_key, day_bucket)
+INSTANCE_ID = uuid.uuid4().hex[:6]
+
+# Dedup policy:
+#  - DB-enforced unique on (product_key, day_bucket)
+#  - We insert FIRST (atomic). If duplicate -> skip forwarding.
+
 # ================= WEB SERVER =================
 app = Flask(__name__)
 
@@ -75,20 +79,6 @@ def parse_sources(raw: str) -> List[object]:
 
 SOURCE_CHANNELS = parse_sources(SOURCE_CHANNELS_RAW)
 
-async def safe_sleep(seconds: int):
-    try:
-        await asyncio.sleep(seconds)
-    except Exception:
-        pass
-
-async def log(msg: str):
-    # Always print locally + attempt TG log
-    print(msg, flush=True)
-    try:
-        await client.send_message(LOG_CHANNEL_ID, msg)
-    except Exception as e:
-        print(f"[LOG SEND FAIL] {repr(e)}", flush=True)
-
 def normalize_text(text: str) -> str:
     text = (text or "").lower()
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
@@ -98,6 +88,7 @@ def normalize_text(text: str) -> str:
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+# Better URL extraction (avoids capturing trailing punctuation)
 _URL_RE = re.compile(r"(https?://[^\s<>\"]+)", re.IGNORECASE)
 
 def extract_urls(text: str) -> List[str]:
@@ -106,7 +97,7 @@ def extract_urls(text: str) -> List[str]:
     urls: List[str] = []
     for m in _URL_RE.finditer(text):
         u = m.group(1).strip()
-        u = u.rstrip(").,;!?:]}'\"")  # strip common trailing punctuation
+        u = u.rstrip(").,;!?:]}'\"")
         urls.append(u)
     return urls
 
@@ -114,7 +105,7 @@ def extract_product_key(url: str) -> Optional[str]:
     if not url:
         return None
 
-    # Amazon
+    # Amazon patterns
     m = re.search(r"/dp/([A-Z0-9]{10})(?:[/?]|$)", url)
     if m:
         return f"amazon_{m.group(1)}"
@@ -127,7 +118,7 @@ def extract_product_key(url: str) -> Optional[str]:
     if m:
         return f"amazon_{m.group(1)}"
 
-    # Flipkart
+    # Flipkart patterns
     m = re.search(r"(?:\?|&)pid=([A-Z0-9]{8,20})(?:&|$)", url, re.IGNORECASE)
     if m:
         return f"flipkart_{m.group(1)}"
@@ -173,6 +164,38 @@ def source_display(chat) -> Tuple[str, str]:
         return title, str(getattr(chat, "id", "unknown"))
     return str(getattr(chat, "id", "unknown")), str(getattr(chat, "id", "unknown"))
 
+async def safe_sleep(seconds: int):
+    try:
+        await asyncio.sleep(seconds)
+    except Exception:
+        pass
+
+# ================= BEAUTIFUL LOGGING (HTML) =================
+def _escape_html(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+async def log_html(html: str):
+    # also print a text-stripped-ish version for platform logs
+    print(re.sub(r"<[^>]+>", "", html), flush=True)
+    try:
+        await client.send_message(LOG_CHANNEL_ID, html, parse_mode="html", link_preview=False)
+    except Exception as e:
+        print(f"[LOG SEND FAIL] {repr(e)}", flush=True)
+
+def fmt_header(title: str) -> str:
+    return f"🧠 <b>{_escape_html(title)}</b>  <code>{INSTANCE_ID}</code>"
+
+def fmt_kv(k: str, v: str) -> str:
+    return f"<b>{_escape_html(k)}:</b> {_escape_html(v)}"
+
+def fmt_key(key: str) -> str:
+    return f"<b>Key:</b> <code>{_escape_html(key)}</code>"
+
+def fmt_link(link: Optional[str]) -> str:
+    if not link:
+        return "<b>Link:</b> n/a"
+    return f"<b>Link:</b> <a href=\"{_escape_html(link)}\">open</a>"
+
 # ================= DB INSERT-FIRST (ATOMIC DEDUP) =================
 def _db_try_insert_sync(product_key: str, product_name: str, source_channel: str) -> bool:
     """
@@ -188,8 +211,7 @@ def _db_try_insert_sync(product_key: str, product_name: str, source_channel: str
         }).execute()
         return True
     except APIError as e:
-        # Postgres unique violation code
-        if "23505" in str(e):
+        if "23505" in str(e):  # unique_violation
             return False
         raise
 
@@ -223,13 +245,21 @@ async def forward_album(dest_entity, messages):
 # ================= MAIN =================
 async def main():
     await client.start()
-    await log("🚀 Userbot started")
+    await log_html(f"{fmt_header('Userbot started')}")
 
     # Resolve destination once
     try:
         dest_entity = await client.get_entity(DEST_BOT)
+        await log_html(
+            f"{fmt_header('Destination resolved')}\n"
+            f"{fmt_kv('To', DEST_BOT)}"
+        )
     except Exception as e:
-        await log(f"❌ Cannot resolve DEST_BOT {DEST_BOT}\n{repr(e)}")
+        await log_html(
+            f"❌ {fmt_header('DEST resolve failed')}\n"
+            f"{fmt_kv('To', DEST_BOT)}\n"
+            f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
+        )
         return
 
     # Resolve sources
@@ -238,16 +268,26 @@ async def main():
         try:
             ent = await client.get_entity(ch)
             source_entities.append(ent)
-            await log(f"✅ Source resolved: {ch}")
+            await log_html(
+                f"✅ {fmt_header('Source resolved')}\n"
+                f"{fmt_kv('Source', str(ch))}"
+            )
         except Exception as e:
-            await log(f"❌ Cannot access source {ch}\n{repr(e)}")
+            await log_html(
+                f"❌ {fmt_header('Source access failed')}\n"
+                f"{fmt_kv('Source', str(ch))}\n"
+                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
+            )
 
     if not source_entities:
-        await log("❌ No valid source channels. Exiting.")
+        await log_html(f"❌ {fmt_header('No valid sources')}") 
         return
 
-    await log(f"👀 Watching: {SOURCE_CHANNELS}")
-    await log(f"➡️ Forwarding to: {DEST_BOT}")
+    await log_html(
+        f"{fmt_header('Watching')}\n"
+        f"{fmt_kv('Sources', ', '.join(map(str, SOURCE_CHANNELS)))}\n"
+        f"{fmt_kv('Forwarding to', DEST_BOT)}"
+    )
 
     # --- Album handler (grouped media)
     @client.on(events.Album(chats=source_entities))
@@ -269,7 +309,7 @@ async def main():
         if not product_key:
             product_key = f"album_{text_hash(normalize_text(all_text))}"
 
-        # INSERT FIRST (atomic). If duplicate => skip.
+        # INSERT FIRST (atomic)
         try:
             inserted = await asyncio.to_thread(
                 _db_try_insert_sync,
@@ -278,11 +318,22 @@ async def main():
                 src_tag
             )
         except Exception as e:
-            await log(f"❌ DB INSERT ERROR (album)\nfrom={src_pretty}\nkey={product_key}\n{repr(e)}")
+            await log_html(
+                f"❌ {fmt_header('DB insert error (album)')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}\n"
+                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
+            )
             return
 
         if not inserted:
-            await log(f"🔁 DUPLICATE SKIPPED (album)\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}")
+            await log_html(
+                f"🔁 {fmt_header('Duplicate skipped (album)')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}"
+            )
             return
 
         # Forward after insert succeeded
@@ -290,24 +341,45 @@ async def main():
             try:
                 await forward_album(dest_entity, event.messages)
             except FloodWaitError as fw:
-                await log(f"⏳ FloodWait {fw.seconds}s (album). Sleeping then retry.\nfrom={src_pretty}")
+                await log_html(
+                    f"⏳ {fmt_header('FloodWait (album)')}\n"
+                    f"{fmt_kv('Seconds', str(fw.seconds))}\n"
+                    f"{fmt_kv('From', src_pretty)}\n"
+                    f"{fmt_key(product_key)}"
+                )
                 await safe_sleep(int(fw.seconds) + 1)
                 await forward_album(dest_entity, event.messages)
 
-            await log(f"✅ FORWARDED (album)\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}")
+            await log_html(
+                f"✅ {fmt_header('Forwarded (album)')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}"
+            )
 
         except RPCError as e:
-            await log(f"❌ RPC ERROR (album)\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}\n{repr(e)}")
+            await log_html(
+                f"❌ {fmt_header('RPC error (album)')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}\n"
+                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
+            )
         except Exception as e:
-            await log(f"❌ HANDLER ERROR (album)\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}\n{repr(e)}")
+            await log_html(
+                f"❌ {fmt_header('Handler error (album)')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}\n"
+                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
+            )
 
     # --- Single message handler (skip grouped media)
     @client.on(events.NewMessage(chats=source_entities))
     async def handler(event: events.NewMessage.Event):
         msg = event.message
         if getattr(msg, "grouped_id", None):
-            # album handler will process
-            return
+            return  # album handler will process
 
         chat = await event.get_chat()
         src_pretty, src_tag = source_display(chat)
@@ -324,12 +396,11 @@ async def main():
 
         if not product_key:
             normalized = normalize_text(text)
-            # If media-only message with no text, make key stable-ish
             if msg.media and not normalized:
                 normalized = f"media_only_{event.chat_id}_{msg.id}"
             product_key = f"text_{text_hash(normalized)}"
 
-        # INSERT FIRST (atomic). If duplicate => skip.
+        # INSERT FIRST (atomic)
         try:
             inserted = await asyncio.to_thread(
                 _db_try_insert_sync,
@@ -338,11 +409,22 @@ async def main():
                 src_tag
             )
         except Exception as e:
-            await log(f"❌ DB INSERT ERROR\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}\n{repr(e)}")
+            await log_html(
+                f"❌ {fmt_header('DB insert error')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}\n"
+                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
+            )
             return
 
         if not inserted:
-            await log(f"🔁 DUPLICATE SKIPPED\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}")
+            await log_html(
+                f"🔁 {fmt_header('Duplicate skipped')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}"
+            )
             return
 
         # Forward after insert succeeded
@@ -354,22 +436,48 @@ async def main():
                     if text.strip():
                         await forward_text(dest_entity, text)
                     else:
-                        await log(f"⚠️ SKIP empty message\nfrom={src_pretty}\nlink={link or 'n/a'}")
+                        await log_html(
+                            f"⚠️ {fmt_header('Empty message skipped')}\n"
+                            f"{fmt_kv('From', src_pretty)}\n"
+                            f"{fmt_link(link)}"
+                        )
                         return
             except FloodWaitError as fw:
-                await log(f"⏳ FloodWait {fw.seconds}s. Sleeping then retry.\nfrom={src_pretty}")
+                await log_html(
+                    f"⏳ {fmt_header('FloodWait')}\n"
+                    f"{fmt_kv('Seconds', str(fw.seconds))}\n"
+                    f"{fmt_kv('From', src_pretty)}\n"
+                    f"{fmt_key(product_key)}"
+                )
                 await safe_sleep(int(fw.seconds) + 1)
                 if msg.media:
                     await forward_media(dest_entity, msg.media, text)
                 else:
                     await forward_text(dest_entity, text)
 
-            await log(f"✅ FORWARDED\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}")
+            await log_html(
+                f"✅ {fmt_header('Forwarded')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}"
+            )
 
         except RPCError as e:
-            await log(f"❌ RPC ERROR\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}\n{repr(e)}")
+            await log_html(
+                f"❌ {fmt_header('RPC error')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}\n"
+                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
+            )
         except Exception as e:
-            await log(f"❌ HANDLER ERROR\nfrom={src_pretty}\nkey={product_key}\nlink={link or 'n/a'}\n{repr(e)}")
+            await log_html(
+                f"❌ {fmt_header('Handler error')}\n"
+                f"{fmt_kv('From', src_pretty)}\n"
+                f"{fmt_key(product_key)}\n"
+                f"{fmt_link(link)}\n"
+                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
+            )
 
     await client.run_until_disconnected()
 
