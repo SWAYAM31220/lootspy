@@ -30,7 +30,7 @@ API_HASH = must_getenv("TG_API_HASH")
 SESSION_STRING = must_getenv("SESSION_STRING")
 
 SOURCE_CHANNELS_RAW = must_getenv("SOURCE_CHANNELS")   # comma-separated: @usernames and/or -100ids
-DEST_BOT = must_getenv("EXTRAPE_BOT")                  # @ExtraPeBot (or any bot/user entity)
+DEST_BOT = must_getenv("EXTRAPE_BOT")                  # @ExtraPeBot
 
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003060200056"))
 PORT = int(os.getenv("PORT", "10000"))
@@ -39,10 +39,6 @@ SUPABASE_URL = must_getenv("SUPABASE_URL")
 SUPABASE_KEY = must_getenv("SUPABASE_KEY")
 
 INSTANCE_ID = uuid.uuid4().hex[:6]
-
-# Dedup policy:
-#  - DB-enforced unique on (product_key, day_bucket)
-#  - We insert FIRST (atomic). If duplicate -> skip forwarding.
 
 # ================= WEB SERVER =================
 app = Flask(__name__)
@@ -88,7 +84,7 @@ def normalize_text(text: str) -> str:
 def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-# Better URL extraction (avoids capturing trailing punctuation)
+# Better URL extraction (avoids trailing punctuation)
 _URL_RE = re.compile(r"(https?://[^\s<>\"]+)", re.IGNORECASE)
 
 def extract_urls(text: str) -> List[str]:
@@ -96,8 +92,7 @@ def extract_urls(text: str) -> List[str]:
         return []
     urls: List[str] = []
     for m in _URL_RE.finditer(text):
-        u = m.group(1).strip()
-        u = u.rstrip(").,;!?:]}'\"")
+        u = m.group(1).strip().rstrip(").,;!?:]}'\"")
         urls.append(u)
     return urls
 
@@ -105,24 +100,21 @@ def extract_product_key(url: str) -> Optional[str]:
     if not url:
         return None
 
-    # Amazon patterns
+    # Amazon
     m = re.search(r"/dp/([A-Z0-9]{10})(?:[/?]|$)", url)
     if m:
         return f"amazon_{m.group(1)}"
-
     m = re.search(r"/gp/product/([A-Z0-9]{10})(?:[/?]|$)", url)
     if m:
         return f"amazon_{m.group(1)}"
-
     m = re.search(r"(?:asin=|ASIN=)([A-Z0-9]{10})", url)
     if m:
         return f"amazon_{m.group(1)}"
 
-    # Flipkart patterns
+    # Flipkart
     m = re.search(r"(?:\?|&)pid=([A-Z0-9]{8,20})(?:&|$)", url, re.IGNORECASE)
     if m:
         return f"flipkart_{m.group(1)}"
-
     m = re.search(r"(itm[a-zA-Z0-9]{6,})(?:[/?]|$)", url)
     if m:
         return f"flipkart_{m.group(1)}"
@@ -130,19 +122,13 @@ def extract_product_key(url: str) -> Optional[str]:
     return None
 
 def message_link(chat, msg_id: int) -> Optional[str]:
-    """
-    Public: https://t.me/<username>/<msg_id>
-    Private/supergroup without username: https://t.me/c/<internal>/<msg_id>
-    """
     try:
         username = getattr(chat, "username", None)
         if username:
             return f"https://t.me/{username}/{msg_id}"
-
         cid = getattr(chat, "id", None)
         if cid is None:
             return None
-
         internal = abs(int(cid)) - 1000000000000
         if internal > 0:
             return f"https://t.me/c/{internal}/{msg_id}"
@@ -151,11 +137,6 @@ def message_link(chat, msg_id: int) -> Optional[str]:
     return None
 
 def source_display(chat) -> Tuple[str, str]:
-    """
-    Returns:
-      src_pretty: '@username' or 'Title' or id
-      src_tag: best identifier for DB
-    """
     username = getattr(chat, "username", None)
     title = getattr(chat, "title", None)
     if username:
@@ -175,45 +156,54 @@ def _escape_html(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 async def log_html(html: str):
-    # also print a text-stripped-ish version for platform logs
+    # Print a readable version to stdout too
     print(re.sub(r"<[^>]+>", "", html), flush=True)
     try:
         await client.send_message(LOG_CHANNEL_ID, html, parse_mode="html", link_preview=False)
     except Exception as e:
         print(f"[LOG SEND FAIL] {repr(e)}", flush=True)
 
-def fmt_header(title: str) -> str:
-    return f"🧠 <b>{_escape_html(title)}</b>  <code>{INSTANCE_ID}</code>"
+def hdr(title: str) -> str:
+    return f"🧾 <b>{_escape_html(title)}</b>  <code>{INSTANCE_ID}</code>"
 
-def fmt_kv(k: str, v: str) -> str:
+def kv(k: str, v: str) -> str:
     return f"<b>{_escape_html(k)}:</b> {_escape_html(v)}"
 
-def fmt_key(key: str) -> str:
-    return f"<b>Key:</b> <code>{_escape_html(key)}</code>"
+def code_line(label: str, value: str) -> str:
+    return f"<b>{_escape_html(label)}:</b> <code>{_escape_html(value)}</code>"
 
-def fmt_link(link: Optional[str]) -> str:
+def link_line(link: Optional[str]) -> str:
     if not link:
         return "<b>Link:</b> n/a"
     return f"<b>Link:</b> <a href=\"{_escape_html(link)}\">open</a>"
 
-# ================= DB INSERT-FIRST (ATOMIC DEDUP) =================
-def _db_try_insert_sync(product_key: str, product_name: str, source_channel: str) -> bool:
+# ================= DB (insert-first + rollback on forward fail) =================
+def _db_try_insert_sync(product_key: str, product_name: str, source_channel: str) -> Tuple[bool, Optional[int]]:
     """
-    Inserts a row for today. Returns True if inserted (NEW).
-    Returns False if duplicate for today (unique violation on (product_key, day_bucket)).
+    Returns:
+      (True, inserted_id) if inserted
+      (False, None) if duplicate (unique violation)
     """
     try:
-        supabase.table("forwarded_deals").insert({
+        res = supabase.table("forwarded_deals").insert({
             "product_key": product_key,
             "product_name": product_name or "",
             "source_channel": source_channel or "",
             "day_bucket": date.today().isoformat(),
         }).execute()
-        return True
+
+        inserted_id = None
+        if res.data and isinstance(res.data, list) and len(res.data) > 0:
+            inserted_id = res.data[0].get("id")
+        return True, inserted_id
+
     except APIError as e:
         if "23505" in str(e):  # unique_violation
-            return False
+            return False, None
         raise
+
+def _db_delete_by_id_sync(row_id: int) -> None:
+    supabase.table("forwarded_deals").delete().eq("id", row_id).execute()
 
 # ================= FORWARDING =================
 async def forward_text(dest_entity, text: str):
@@ -232,7 +222,6 @@ async def forward_album(dest_entity, messages):
         if getattr(m, "message", None):
             caption = m.message
             break
-
     for m in messages:
         if getattr(m, "media", None):
             files.append(m.media)
@@ -245,21 +234,14 @@ async def forward_album(dest_entity, messages):
 # ================= MAIN =================
 async def main():
     await client.start()
-    await log_html(f"{fmt_header('Userbot started')}")
+    await log_html(f"{hdr('Userbot started')}")
 
     # Resolve destination once
     try:
         dest_entity = await client.get_entity(DEST_BOT)
-        await log_html(
-            f"{fmt_header('Destination resolved')}\n"
-            f"{fmt_kv('To', DEST_BOT)}"
-        )
+        await log_html(f"{hdr('Destination resolved')}\n{kv('To', DEST_BOT)}")
     except Exception as e:
-        await log_html(
-            f"❌ {fmt_header('DEST resolve failed')}\n"
-            f"{fmt_kv('To', DEST_BOT)}\n"
-            f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
-        )
+        await log_html(f"❌ {hdr('DEST resolve failed')}\n{kv('To', DEST_BOT)}\n{code_line('Error', repr(e))}")
         return
 
     # Resolve sources
@@ -268,28 +250,21 @@ async def main():
         try:
             ent = await client.get_entity(ch)
             source_entities.append(ent)
-            await log_html(
-                f"✅ {fmt_header('Source resolved')}\n"
-                f"{fmt_kv('Source', str(ch))}"
-            )
+            await log_html(f"✅ {hdr('Source resolved')}\n{kv('Source', str(ch))}")
         except Exception as e:
-            await log_html(
-                f"❌ {fmt_header('Source access failed')}\n"
-                f"{fmt_kv('Source', str(ch))}\n"
-                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
-            )
+            await log_html(f"❌ {hdr('Source access failed')}\n{kv('Source', str(ch))}\n{code_line('Error', repr(e))}")
 
     if not source_entities:
-        await log_html(f"❌ {fmt_header('No valid sources')}") 
+        await log_html(f"❌ {hdr('No valid sources')}")
         return
 
     await log_html(
-        f"{fmt_header('Watching')}\n"
-        f"{fmt_kv('Sources', ', '.join(map(str, SOURCE_CHANNELS)))}\n"
-        f"{fmt_kv('Forwarding to', DEST_BOT)}"
+        f"{hdr('Watching')}\n"
+        f"{kv('Sources', ', '.join(map(str, SOURCE_CHANNELS)))}\n"
+        f"{kv('Forwarding to', DEST_BOT)}"
     )
 
-    # --- Album handler (grouped media)
+    # ---- Album handler
     @client.on(events.Album(chats=source_entities))
     async def album_handler(event: events.Album.Event):
         chat = await event.get_chat()
@@ -309,77 +284,56 @@ async def main():
         if not product_key:
             product_key = f"album_{text_hash(normalize_text(all_text))}"
 
-        # INSERT FIRST (atomic)
+        await log_html(
+            f"📥 {hdr('RECEIVED (album)')}\n"
+            f"{kv('From', src_pretty)}\n"
+            f"{code_line('Key', product_key)}\n"
+            f"{link_line(link)}"
+        )
+
+        # Insert-first
         try:
-            inserted = await asyncio.to_thread(
+            inserted, row_id = await asyncio.to_thread(
                 _db_try_insert_sync,
                 product_key,
                 normalize_text(all_text)[:200],
                 src_tag
             )
         except Exception as e:
-            await log_html(
-                f"❌ {fmt_header('DB insert error (album)')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}\n"
-                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
-            )
+            await log_html(f"❌ {hdr('DB insert error (album)')}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}\n{code_line('Error', repr(e))}")
             return
 
         if not inserted:
-            await log_html(
-                f"🔁 {fmt_header('Duplicate skipped (album)')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}"
-            )
+            await log_html(f"🔁 {hdr('Duplicate skipped (album)')}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}\n{link_line(link)}")
             return
 
-        # Forward after insert succeeded
+        # Forward and rollback DB on failure
         try:
             try:
                 await forward_album(dest_entity, event.messages)
             except FloodWaitError as fw:
-                await log_html(
-                    f"⏳ {fmt_header('FloodWait (album)')}\n"
-                    f"{fmt_kv('Seconds', str(fw.seconds))}\n"
-                    f"{fmt_kv('From', src_pretty)}\n"
-                    f"{fmt_key(product_key)}"
-                )
+                await log_html(f"⏳ {hdr('FloodWait (album)')}\n{kv('Seconds', str(fw.seconds))}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}")
                 await safe_sleep(int(fw.seconds) + 1)
                 await forward_album(dest_entity, event.messages)
 
-            await log_html(
-                f"✅ {fmt_header('Forwarded (album)')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}"
-            )
+            await log_html(f"✅ {hdr('FORWARDED (album)')}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}\n{link_line(link)}")
 
-        except RPCError as e:
-            await log_html(
-                f"❌ {fmt_header('RPC error (album)')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}\n"
-                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
-            )
         except Exception as e:
-            await log_html(
-                f"❌ {fmt_header('Handler error (album)')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}\n"
-                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
-            )
+            # rollback reservation if we know the row id
+            if row_id is not None:
+                try:
+                    await asyncio.to_thread(_db_delete_by_id_sync, row_id)
+                except Exception as rollback_err:
+                    await log_html(f"⚠️ {hdr('Rollback failed (album)')}\n{code_line('Row ID', str(row_id))}\n{code_line('Error', repr(rollback_err))}")
 
-    # --- Single message handler (skip grouped media)
+            await log_html(f"❌ {hdr('Forward failed (album)')}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}\n{link_line(link)}\n{code_line('Error', repr(e))}")
+
+    # ---- Single message handler
     @client.on(events.NewMessage(chats=source_entities))
     async def handler(event: events.NewMessage.Event):
         msg = event.message
         if getattr(msg, "grouped_id", None):
-            return  # album handler will process
+            return  # album handler will handle
 
         chat = await event.get_chat()
         src_pretty, src_tag = source_display(chat)
@@ -400,34 +354,30 @@ async def main():
                 normalized = f"media_only_{event.chat_id}_{msg.id}"
             product_key = f"text_{text_hash(normalized)}"
 
-        # INSERT FIRST (atomic)
+        await log_html(
+            f"📥 {hdr('RECEIVED')}\n"
+            f"{kv('From', src_pretty)}\n"
+            f"{code_line('Key', product_key)}\n"
+            f"{link_line(link)}"
+        )
+
+        # Insert-first
         try:
-            inserted = await asyncio.to_thread(
+            inserted, row_id = await asyncio.to_thread(
                 _db_try_insert_sync,
                 product_key,
                 normalize_text(text)[:200],
                 src_tag
             )
         except Exception as e:
-            await log_html(
-                f"❌ {fmt_header('DB insert error')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}\n"
-                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
-            )
+            await log_html(f"❌ {hdr('DB insert error')}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}\n{link_line(link)}\n{code_line('Error', repr(e))}")
             return
 
         if not inserted:
-            await log_html(
-                f"🔁 {fmt_header('Duplicate skipped')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}"
-            )
+            await log_html(f"🔁 {hdr('Duplicate skipped')}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}\n{link_line(link)}")
             return
 
-        # Forward after insert succeeded
+        # Forward and rollback DB on failure
         try:
             try:
                 if msg.media:
@@ -436,48 +386,31 @@ async def main():
                     if text.strip():
                         await forward_text(dest_entity, text)
                     else:
-                        await log_html(
-                            f"⚠️ {fmt_header('Empty message skipped')}\n"
-                            f"{fmt_kv('From', src_pretty)}\n"
-                            f"{fmt_link(link)}"
-                        )
+                        await log_html(f"⚠️ {hdr('Empty message skipped')}\n{kv('From', src_pretty)}\n{link_line(link)}")
+                        # rollback because we didn't forward
+                        if row_id is not None:
+                            await asyncio.to_thread(_db_delete_by_id_sync, row_id)
                         return
+
             except FloodWaitError as fw:
-                await log_html(
-                    f"⏳ {fmt_header('FloodWait')}\n"
-                    f"{fmt_kv('Seconds', str(fw.seconds))}\n"
-                    f"{fmt_kv('From', src_pretty)}\n"
-                    f"{fmt_key(product_key)}"
-                )
+                await log_html(f"⏳ {hdr('FloodWait')}\n{kv('Seconds', str(fw.seconds))}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}")
                 await safe_sleep(int(fw.seconds) + 1)
                 if msg.media:
                     await forward_media(dest_entity, msg.media, text)
                 else:
                     await forward_text(dest_entity, text)
 
-            await log_html(
-                f"✅ {fmt_header('Forwarded')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}"
-            )
+            await log_html(f"✅ {hdr('FORWARDED')}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}\n{link_line(link)}")
 
-        except RPCError as e:
-            await log_html(
-                f"❌ {fmt_header('RPC error')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}\n"
-                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
-            )
-        except Exception as e:
-            await log_html(
-                f"❌ {fmt_header('Handler error')}\n"
-                f"{fmt_kv('From', src_pretty)}\n"
-                f"{fmt_key(product_key)}\n"
-                f"{fmt_link(link)}\n"
-                f"<b>Error:</b> <code>{_escape_html(repr(e))}</code>"
-            )
+        except (RPCError, Exception) as e:
+            # rollback reservation
+            if row_id is not None:
+                try:
+                    await asyncio.to_thread(_db_delete_by_id_sync, row_id)
+                except Exception as rollback_err:
+                    await log_html(f"⚠️ {hdr('Rollback failed')}\n{code_line('Row ID', str(row_id))}\n{code_line('Error', repr(rollback_err))}")
+
+            await log_html(f"❌ {hdr('Forward failed')}\n{kv('From', src_pretty)}\n{code_line('Key', product_key)}\n{link_line(link)}\n{code_line('Error', repr(e))}")
 
     await client.run_until_disconnected()
 
