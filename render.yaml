@@ -1,10 +1,16 @@
+# Free plan only exists for web services (workers need a paid plan).
+# A free web service sleeps after ~15 min without inbound traffic, so point an
+# external pinger (UptimeRobot / cron-job.org) at https://<your-service>.onrender.com/ping
+# every 5 minutes. If you move to a paid plan, change `type: web` to `type: worker`
+# (and plan to starter) and the pinger is no longer needed.
 services:
-  - type: worker
-    name: deal-forwarder-bot
-    env: python
+  - type: web
+    name: lootspy
+    runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python deal_forwarder_bot_render.py
-    plan: free
+    healthCheckPath: /ping
     envVars:
       - key: TG_API_ID
         sync: false
@@ -12,13 +18,24 @@ services:
         sync: false
       - key: SESSION_STRING
         sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_KEY
-        sync: false
       - key: SOURCE_CHANNELS
         sync: false
       - key: EXTRAPE_BOT
         sync: false
+      - key: LOG_CHANNEL_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.9
+      # Tunables (defaults shown). Start with DRY_RUN=1 to tune without forwarding.
+      - key: DRY_RUN
+        value: "0"
+      - key: MIN_MRP_DISCOUNT
+        value: "60"
+      - key: MIN_MEDIAN_DISCOUNT
+        value: "10"
+      - key: LOOKUPS_PER_MIN
+        value: "20"
